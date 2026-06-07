@@ -1,0 +1,648 @@
+#include <Arduino_GFX_Library.h>
+#include <XPT2046_Touchscreen.h>
+#include <SPI.h>
+#include "USB.h"
+#include "USBHIDKeyboard.h"
+#include <WiFi.h>
+#include <time.h>
+#include <TOTP.h>
+
+// ===== Display Pins =====
+#define TFT_CS    10
+#define TFT_DC    5
+#define TFT_RST   4
+#define TFT_MOSI  11
+#define TFT_SCLK  12
+#define TFT_MISO  13
+
+// ===== Touch Pins =====
+#define TOUCH_CS  9
+#define TOUCH_IRQ 8
+
+// ===== Colors =====
+#define COLOR_BLACK     0x0000
+#define COLOR_WHITE     0xFFFF
+#define COLOR_RED       0xF800
+#define COLOR_GREEN     0x07E0
+#define COLOR_BLUE      0x001F
+#define COLOR_CYAN      0x07FF
+#define COLOR_YELLOW    0xFFE0
+#define COLOR_DARKGREY  0x7BEF
+#define COLOR_LIGHTGREY 0xC618
+
+Arduino_DataBus *bus = new Arduino_ESP32SPI(
+  TFT_DC,
+  TFT_CS,
+  TFT_SCLK,
+  TFT_MOSI,
+  TFT_MISO
+);
+
+Arduino_GFX *gfx = new Arduino_ILI9341(
+  bus,
+  TFT_RST,
+  1
+);
+
+XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
+
+// ===== Menu =====
+enum MenuScreen {
+  SCREEN_MAIN,
+  SCREEN_PASSWORDS,
+  SCREEN_PASSWORD_ACTIONS,
+  SCREEN_TOTP,
+  SCREEN_TOTP_VIEW,
+  SCREEN_SETTINGS
+};
+
+MenuScreen currentScreen = SCREEN_MAIN;
+int selectedIndex = 0;
+int menuScrollOffset = 0;
+int activePasswordIndex = 0;
+USBHIDKeyboard Keyboard;
+uint8_t gmailTotpSecret[64];
+size_t gmailTotpSecretLen = 0;
+TOTP* gmailTotp = nullptr;
+
+bool timeSynced = false;
+unsigned long lastTotpRedraw = 0;
+
+const char* WIFI_SSID = "YOUR_WIFI_NAME";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+// Example format only. Replace with your real Base32 secret later.
+const char* GMAIL_TOTP_BASE32 = "aaaa bbbb cccc dddd eeee ffff gggg hhhh";
+
+const char* NTP_SERVER_1 = "pool.ntp.org";
+const char* NTP_SERVER_2 = "time.google.com";
+
+// Qatar/Saudi time = UTC+3
+const long GMT_OFFSET_SEC = 3 * 3600;
+const int DAYLIGHT_OFFSET_SEC = 0;
+
+const char* mainMenuItems[] = {
+  "Passwords",
+  "TOTP",
+  "Settings"
+};
+
+const char* passwordMenuItems[] = {
+  "Gmail",
+  "GitHub",
+  "AWS",
+  "Bank"
+};
+
+const char* totpMenuItems[] = {
+  "Google TOTP"
+};
+
+const char* passwordActionMenuItems[] = {
+  "Username",
+  "Password",
+  "UserTabPass"
+};
+
+const char* passwordUsernames[] = {
+  "user.alpha01",
+  "bluefalcon77",
+  "cloud.user23",
+  "banking_hero"
+};
+
+const char* passwordValues[] = {
+  "MyGmailPassword123",
+  "MyGitHubPassword456",
+  "MyAwsPassword789",
+  "MyBankPassword000"
+};
+
+int getCurrentMenuCount() {
+  if (currentScreen == SCREEN_MAIN) return 3;
+  if (currentScreen == SCREEN_PASSWORDS) return 4;
+  if (currentScreen == SCREEN_PASSWORD_ACTIONS) return 3;
+  if (currentScreen == SCREEN_TOTP) return 1;
+  if (currentScreen == SCREEN_SETTINGS) return 0;
+  return 0;
+}
+
+const char* getCurrentMenuItem(int i) {
+  if (currentScreen == SCREEN_MAIN) return mainMenuItems[i];
+  if (currentScreen == SCREEN_PASSWORDS) return passwordMenuItems[i];
+  if (currentScreen == SCREEN_PASSWORD_ACTIONS) return passwordActionMenuItems[i];
+  if (currentScreen == SCREEN_TOTP) return totpMenuItems[i];
+  return "";
+}
+
+const char* getScreenTitle() {
+  if (currentScreen == SCREEN_MAIN) return "PassFill";
+  if (currentScreen == SCREEN_PASSWORDS) return "Passwords";
+  if (currentScreen == SCREEN_PASSWORD_ACTIONS) return "Send As";
+  if (currentScreen == SCREEN_TOTP) return "TOTP";
+  if (currentScreen == SCREEN_SETTINGS) return "Settings";
+  return "";
+}
+
+void drawMenu() {
+  gfx->fillScreen(COLOR_BLACK);
+
+  // Header
+  gfx->fillRoundRect(8, 8, 304, 38, 8, COLOR_DARKGREY);
+  gfx->setTextColor(COLOR_WHITE, COLOR_DARKGREY);
+  gfx->setTextSize(2);
+  gfx->setCursor(18, 19);
+  gfx->println(getScreenTitle());
+
+  int itemCount = getCurrentMenuCount();
+
+  const int startY = 58;
+  const int cardHeight = 38;
+  const int cardGap = 8;
+  const int visibleItems = 4;
+
+  if (selectedIndex < menuScrollOffset) {
+    menuScrollOffset = selectedIndex;
+  }
+
+  if (selectedIndex >= menuScrollOffset + visibleItems) {
+    menuScrollOffset = selectedIndex - visibleItems + 1;
+  }
+
+  if (menuScrollOffset < 0) menuScrollOffset = 0;
+  if (itemCount <= visibleItems) menuScrollOffset = 0;
+
+  int endIndex = menuScrollOffset + visibleItems;
+  if (endIndex > itemCount) endIndex = itemCount;
+
+  int y = startY;
+
+  for (int i = menuScrollOffset; i < endIndex; i++) {
+    uint16_t bgColor = (i == selectedIndex) ? COLOR_LIGHTGREY : COLOR_DARKGREY;
+    uint16_t textColor = (i == selectedIndex) ? COLOR_GREEN : COLOR_WHITE;
+
+    gfx->fillRoundRect(14, y, 292, cardHeight, 8, bgColor);
+    gfx->drawRoundRect(14, y, 292, cardHeight, 8, COLOR_WHITE);
+
+    gfx->setTextColor(textColor, bgColor);
+    gfx->setTextSize(2);
+    gfx->setCursor(28, y + 11);
+    gfx->println(getCurrentMenuItem(i));
+
+    y += cardHeight + cardGap;
+  }
+
+  // Bottom navigation bar
+  gfx->fillRect(0, 205, 320, 35, COLOR_BLACK);
+
+  if (currentScreen != SCREEN_MAIN) {
+    gfx->fillRoundRect(8, 205, 105, 30, 6, COLOR_DARKGREY);
+    gfx->setTextColor(COLOR_WHITE, COLOR_DARKGREY);
+    gfx->setTextSize(2);
+    gfx->setCursor(24, 213);
+    gfx->print("Back");
+  }
+
+  gfx->setTextColor(COLOR_CYAN, COLOR_BLACK);
+  gfx->setTextSize(1);
+  gfx->setCursor(210, 218);
+  gfx->print("Tap to select");
+}
+void handleBackAction() {
+  if (currentScreen == SCREEN_MAIN) {
+    drawMenu();
+    return;
+  }
+
+  if (currentScreen == SCREEN_PASSWORD_ACTIONS) {
+    currentScreen = SCREEN_PASSWORDS;
+    selectedIndex = activePasswordIndex;
+    menuScrollOffset = 0;
+    drawMenu();
+    return;
+  }
+
+  if (currentScreen == SCREEN_TOTP_VIEW) {
+    currentScreen = SCREEN_TOTP;
+    selectedIndex = 0;
+    menuScrollOffset = 0;
+    drawMenu();
+    return;
+  }
+
+  currentScreen = SCREEN_MAIN;
+  selectedIndex = 0;
+  menuScrollOffset = 0;
+  drawMenu();
+}
+
+void drawBootScreen() {
+  gfx->fillScreen(COLOR_BLACK);
+
+  gfx->fillRoundRect(30, 65, 260, 95, 14, COLOR_DARKGREY);
+
+  gfx->setTextColor(COLOR_GREEN, COLOR_DARKGREY);
+  gfx->setTextSize(3);
+  gfx->setCursor(55, 88);
+  gfx->println("Dr. Pass");
+
+  gfx->setTextColor(COLOR_WHITE, COLOR_DARKGREY);
+  gfx->setTextSize(1);
+  gfx->setCursor(86, 132);
+  gfx->println("Secure Password Deck");
+}
+
+void showSendingScreen(const char* text) {
+  gfx->fillScreen(COLOR_BLACK);
+
+  gfx->fillRoundRect(25, 45, 270, 120, 12, COLOR_DARKGREY);
+
+  gfx->setTextColor(COLOR_CYAN, COLOR_DARKGREY);
+  gfx->setTextSize(2);
+  gfx->setCursor(95, 65);
+  gfx->println("Sending");
+
+  gfx->setTextColor(COLOR_WHITE, COLOR_DARKGREY);
+  gfx->setTextSize(2);
+  gfx->setCursor(45, 105);
+  gfx->println(text);
+
+  gfx->setTextColor(COLOR_GREEN, COLOR_DARKGREY);
+  gfx->setTextSize(1);
+  gfx->setCursor(80, 145);
+  gfx->println("Typing via USB...");
+}
+
+void openSelectedItem() {
+  if (currentScreen == SCREEN_MAIN) {
+    if (selectedIndex == 0) {
+      currentScreen = SCREEN_PASSWORDS;
+      selectedIndex = 0;
+      menuScrollOffset = 0;
+      drawMenu();
+      return;
+    }
+
+    if (selectedIndex == 1) {
+      currentScreen = SCREEN_TOTP;
+      selectedIndex = 0;
+      menuScrollOffset = 0;
+      drawMenu();
+      return;
+    }
+
+    if (selectedIndex == 2) {
+      currentScreen = SCREEN_SETTINGS;
+      gfx->fillScreen(COLOR_BLACK);
+      gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
+      gfx->setTextSize(2);
+      gfx->setCursor(30, 80);
+      gfx->println("Settings Portal");
+      gfx->setCursor(30, 120);
+      gfx->println("Coming later");
+      gfx->setTextSize(1);
+      gfx->setCursor(8, 225);
+      gfx->println("< Back");
+      return;
+    }
+  }
+
+  if (currentScreen == SCREEN_PASSWORDS) {
+    activePasswordIndex = selectedIndex;
+    currentScreen = SCREEN_PASSWORD_ACTIONS;
+    selectedIndex = 0;
+    menuScrollOffset = 0;
+    drawMenu();
+    return;
+  }
+
+  if (currentScreen == SCREEN_TOTP) {
+    if (!timeSynced) {
+      if (!syncTimeOverWiFi()) {
+        drawMenu();
+        return;
+      }
+
+      timeSynced = true;
+    }
+
+    currentScreen = SCREEN_TOTP_VIEW;
+    lastTotpRedraw = 0;
+    return;
+  }
+
+  if (currentScreen == SCREEN_PASSWORD_ACTIONS) {
+    showSendingScreen(passwordMenuItems[activePasswordIndex]);
+    delay(300);
+
+    if (selectedIndex == 0) {
+      Keyboard.print(passwordUsernames[activePasswordIndex]);
+    } else if (selectedIndex == 1) {
+      Keyboard.print(passwordValues[activePasswordIndex]);
+    } else if (selectedIndex == 2) {
+      Keyboard.print(passwordUsernames[activePasswordIndex]);
+      Keyboard.write(KEY_TAB);
+      Keyboard.print(passwordValues[activePasswordIndex]);
+    }
+
+    delay(600);
+    drawMenu();
+    return;
+  }
+}
+
+void handleTouch() {
+  static unsigned long lastTouchMs = 0;
+
+  if (!touch.touched()) return;
+
+  unsigned long now = millis();
+
+  if (now - lastTouchMs < 250) return;
+  lastTouchMs = now;
+
+  TS_Point p = touch.getPoint();
+
+  int x = map(p.x, 200, 3900, 0, gfx->width());
+  int y = map(p.y, 200, 3900, 0, gfx->height());
+
+  if (currentScreen == SCREEN_TOTP_VIEW) {
+    if (x < 130 && y > 190) {
+      handleBackAction();
+      return;
+    }
+    if (x >= 30 && x <= 290 && y >= 55 && y <= 150) {
+      time_t nowTime;
+
+      if (!getCurrentUnixTime(nowTime)) {
+        return;
+      }
+
+      char* code = gmailTotp->getCode(nowTime);
+      Keyboard.print(code);
+
+      showSendingScreen("Google TOTP");
+      delay(600);
+
+      lastTotpRedraw = 0;
+      return;
+    }
+
+    return;
+  }
+
+  Serial.print("Touch x=");
+  Serial.print(x);
+  Serial.print(" y=");
+  Serial.println(y);
+
+  // Large back button zone
+  if (currentScreen != SCREEN_MAIN && x < 130 && y > 190) {
+    handleBackAction();
+    return;
+  }
+
+  int itemCount = getCurrentMenuCount();
+
+  if (itemCount <= 0) {
+    return;
+  }
+
+  const int startY = 58;
+  const int cardHeight = 38;
+  const int cardGap = 8;
+  const int visibleItems = 4;
+
+  for (int row = 0; row < visibleItems; row++) {
+    int cardY = startY + row * (cardHeight + cardGap);
+    int tappedIndex = menuScrollOffset + row;
+
+    if (tappedIndex >= itemCount) continue;
+
+    if (x >= 14 && x <= 306 && y >= cardY && y <= cardY + cardHeight) {
+      selectedIndex = tappedIndex;
+      drawMenu();
+      delay(120);
+      openSelectedItem();
+      return;
+    }
+  }
+}
+
+int base32Value(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a';
+  if (c >= '2' && c <= '7') return c - '2' + 26;
+  return -1;
+}
+
+size_t decodeBase32(const char* input, uint8_t* output, size_t maxOutputLen) {
+  int buffer = 0;
+  int bitsLeft = 0;
+  size_t outLen = 0;
+
+  while (*input) {
+    char c = *input++;
+
+    if (c == ' ' || c == '=' || c == '-') continue;
+
+    int val = base32Value(c);
+    if (val < 0) continue;
+
+    buffer = (buffer << 5) | val;
+    bitsLeft += 5;
+
+    if (bitsLeft >= 8) {
+      bitsLeft -= 8;
+
+      if (outLen >= maxOutputLen) return 0;
+
+      output[outLen++] = (buffer >> bitsLeft) & 0xFF;
+    }
+  }
+
+  return outLen;
+}
+
+bool initTotp() {
+  gmailTotpSecretLen = decodeBase32(
+    GMAIL_TOTP_BASE32,
+    gmailTotpSecret,
+    sizeof(gmailTotpSecret)
+  );
+
+  if (gmailTotpSecretLen == 0) {
+    return false;
+  }
+
+  gmailTotp = new TOTP(gmailTotpSecret, gmailTotpSecretLen);
+  return true;
+}
+
+void showStatusScreen(const char* title, const char* subtitle) {
+  gfx->fillScreen(COLOR_BLACK);
+
+  gfx->fillRoundRect(25, 55, 270, 110, 12, COLOR_DARKGREY);
+
+  gfx->setTextColor(COLOR_CYAN, COLOR_DARKGREY);
+  gfx->setTextSize(2);
+  gfx->setCursor(45, 80);
+  gfx->println(title);
+
+  gfx->setTextColor(COLOR_WHITE, COLOR_DARKGREY);
+  gfx->setTextSize(1);
+  gfx->setCursor(55, 125);
+  gfx->println(subtitle);
+}
+
+bool syncTimeOverWiFi() {
+  showStatusScreen("Connecting WiFi", "Syncing time...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  delay(300);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long start = millis();
+
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    delay(250);
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    showStatusScreen("WiFi Failed", "Check SSID/password");
+    delay(1500);
+    return false;
+  }
+
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
+
+  struct tm timeinfo;
+  start = millis();
+
+  while (millis() - start < 20000) {
+    if (getLocalTime(&timeinfo)) {
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+
+      showStatusScreen("Time Synced", "Ready");
+      delay(700);
+      return true;
+    }
+
+    delay(250);
+  }
+
+  showStatusScreen("Time Failed", "NTP error");
+  delay(1500);
+  return false;
+}
+
+bool getCurrentUnixTime(time_t &unixTime) {
+  time(&unixTime);
+  return unixTime > 1700000000;
+}
+
+void showTotpCodeScreen(const char* title, const char* code, int secondsRemaining) {
+  gfx->fillScreen(COLOR_BLACK);
+
+  // Header
+  gfx->fillRoundRect(8, 8, 304, 38, 8, COLOR_DARKGREY);
+  gfx->setTextColor(COLOR_WHITE, COLOR_DARKGREY);
+  gfx->setTextSize(2);
+  gfx->setCursor(18, 19);
+  gfx->println(title);
+
+  // Code box
+  gfx->fillRoundRect(35, 65, 250, 70, 12, COLOR_DARKGREY);
+  gfx->drawRoundRect(35, 65, 250, 70, 12, COLOR_WHITE);
+
+  gfx->setTextColor(COLOR_GREEN, COLOR_DARKGREY);
+  gfx->setTextSize(4);
+  gfx->setCursor(80, 85);
+  gfx->println(code);
+
+  // Timer bar
+  int barX = 45;
+  int barY = 155;
+  int barW = 210;
+  int barH = 14;
+
+  int progressWidth = map(secondsRemaining, 0, 30, 0, barW);
+
+  gfx->drawRoundRect(barX, barY, barW, barH, 7, COLOR_WHITE);
+  gfx->fillRoundRect(barX + 2, barY + 2, progressWidth - 4, barH - 4, 5, COLOR_GREEN);
+
+  gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
+  gfx->setTextSize(2);
+  gfx->setCursor(265, 152);
+  gfx->print(secondsRemaining);
+  gfx->print("s");
+
+  // Back button
+  gfx->fillRoundRect(8, 205, 105, 30, 6, COLOR_DARKGREY);
+  gfx->setTextColor(COLOR_WHITE, COLOR_DARKGREY);
+  gfx->setTextSize(2);
+  gfx->setCursor(24, 213);
+  gfx->print("Back");
+
+  gfx->setTextColor(COLOR_CYAN, COLOR_BLACK);
+  gfx->setTextSize(1);
+  gfx->setCursor(185, 218);
+  gfx->print("Tap code to type");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  gfx->begin();
+  gfx->fillScreen(COLOR_BLACK);
+
+  SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI);
+
+  touch.begin();
+  touch.setRotation(1);
+
+  if (!initTotp()) {
+    gfx->fillScreen(COLOR_BLACK);
+    gfx->setTextColor(COLOR_RED, COLOR_BLACK);
+    gfx->setTextSize(2);
+    gfx->setCursor(25, 80);
+    gfx->println("TOTP Error");
+    gfx->setCursor(25, 120);
+    gfx->println("Bad Base32");
+    while (true) delay(1000);
+  }
+
+  drawBootScreen();
+  delay(1200);
+  drawMenu();
+
+  Keyboard.begin();
+  USB.begin();
+
+  delay(800);
+}
+
+void loop() {
+
+  if (currentScreen == SCREEN_TOTP_VIEW) {
+    time_t nowTime;
+
+    if (getCurrentUnixTime(nowTime)) {
+      int secondsRemaining = 30 - (nowTime % 30);
+      if (secondsRemaining == 30) secondsRemaining = 0;
+
+      if (lastTotpRedraw != (unsigned long)nowTime) {
+        char* code = gmailTotp->getCode(nowTime);
+        showTotpCodeScreen("Google TOTP", code, secondsRemaining);
+        lastTotpRedraw = (unsigned long)nowTime;
+      }
+    }
+  }
+  
+  handleTouch();
+  delay(20);
+}
