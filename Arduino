@@ -9,6 +9,7 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
+#include "qrcode.h"
 
 // ===== Display Pins =====
 #define TFT_CS    10
@@ -85,8 +86,8 @@ String settingsApPassword;
 bool timeSynced = false;
 unsigned long lastTotpRedraw = 0;
 
-const char* WIFI_SSID = "wifi_here";
-const char* WIFI_PASSWORD = "password_here";
+const char* WIFI_SSID = "WIFI_here";
+const char* WIFI_PASSWORD = "PASSWORD_here";
 
 const char* NTP_SERVER_1 = "pool.ntp.org";
 const char* NTP_SERVER_2 = "time.google.com";
@@ -198,41 +199,69 @@ const char* getScreenTitle() {
   return "";
 }
 
+void drawWifiQRCode(String ssid, String password) {
+  String qrText = "WIFI:T:WPA;S:" + ssid + ";P:" + password + ";H:false;;";
+
+  QRCode qrcode;
+
+  const uint8_t qrVersion = 5;
+  uint8_t qrcodeData[qrcode_getBufferSize(qrVersion)];
+
+  qrcode_initText(
+    &qrcode,
+    qrcodeData,
+    qrVersion,
+    ECC_LOW,
+    qrText.c_str()
+  );
+
+  int scale = 4;
+  int qrSize = qrcode.size * scale;
+
+  int xOffset = (gfx->width() - qrSize) / 2;
+  int yOffset = 52;
+
+  gfx->fillRect(xOffset - 6, yOffset - 6, qrSize + 12, qrSize + 12, COLOR_WHITE);
+
+  for (uint8_t y = 0; y < qrcode.size; y++) {
+    for (uint8_t x = 0; x < qrcode.size; x++) {
+      if (qrcode_getModule(&qrcode, x, y)) {
+        gfx->fillRect(
+          xOffset + x * scale,
+          yOffset + y * scale,
+          scale,
+          scale,
+          COLOR_BLACK
+        );
+      }
+    }
+  }
+}
+
 void drawSettingsPortalScreen() {
   gfx->fillScreen(COLOR_BLACK);
 
+  // Header
   gfx->fillRoundRect(8, 8, 304, 38, 8, COLOR_DARKGREY);
   gfx->setTextColor(COLOR_WHITE, COLOR_DARKGREY);
   gfx->setTextSize(2);
   gfx->setCursor(18, 19);
   gfx->println("Settings Portal");
 
-  gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
-  gfx->setTextSize(2);
+  // Draw Wi-Fi QR
+  drawWifiQRCode("PassFill", settingsApPassword);
 
-  gfx->setCursor(16, 60);
-  gfx->println("SSID:");
-  gfx->setCursor(90, 60);
-  gfx->println("PassFill");
-
-  gfx->setCursor(16, 95);
-  gfx->println("PASS:");
-  gfx->setCursor(90, 95);
-  gfx->setTextSize(1);
-  gfx->println(settingsApPassword);
-  gfx->setTextSize(2);
-
-  gfx->setTextSize(1);
+  // Bottom info
   gfx->setTextColor(COLOR_CYAN, COLOR_BLACK);
-  gfx->setCursor(16, 135);
-  gfx->println("Connect to this Wi-Fi network.");
-  gfx->setCursor(16, 150);
-  gfx->println("Then open any webpage.");
+  gfx->setTextSize(1);
+  gfx->setCursor(35, 215);
+  gfx->println("Scan QR to connect to PassFill");
 
-  gfx->fillRoundRect(8, 205, 105, 30, 6, COLOR_DARKGREY);
+  // Back button
+  gfx->fillRoundRect(8, 185, 90, 28, 6, COLOR_DARKGREY);
   gfx->setTextColor(COLOR_WHITE, COLOR_DARKGREY);
   gfx->setTextSize(2);
-  gfx->setCursor(24, 213);
+  gfx->setCursor(22, 193);
   gfx->print("Back");
 }
 
@@ -494,7 +523,7 @@ void handleTouch() {
   //for Settings
   if (settingsPortalActive) {
     // Back button
-    if (x < 130 && y > 190) {
+    if (x < 120 && y > 175) {
       stopSettingsPortal();
       currentScreen = SCREEN_MAIN;
       selectedIndex = 0;
