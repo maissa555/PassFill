@@ -6,6 +6,9 @@
 #include <WiFi.h>
 #include <time.h>
 #include <TOTP.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
 
 // ===== Display Pins =====
 #define TFT_CS    10
@@ -61,18 +64,29 @@ int selectedIndex = 0;
 int menuScrollOffset = 0;
 int activePasswordIndex = 0;
 USBHIDKeyboard Keyboard;
-uint8_t gmailTotpSecret[64];
-size_t gmailTotpSecretLen = 0;
-TOTP* gmailTotp = nullptr;
+uint8_t activeTotpSecret[64];
+size_t activeTotpSecretLen = 0;
+TOTP* activeTotp = nullptr;
+int activeTotpEntryIndex = -1;
+//Settings
+WebServer server(80);
+DNSServer dnsServer;
+Preferences prefs;
+
+const byte DNS_PORT = 53;
+
+void startSettingsPortal();
+void stopSettingsPortal();
+void processSettingsPortal();
+
+bool settingsPortalActive = false;
+String settingsApPassword;
 
 bool timeSynced = false;
 unsigned long lastTotpRedraw = 0;
 
-const char* WIFI_SSID = "YOUR_WIFI_NAME";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
-
-// Example format only. Replace with your real Base32 secret later.
-const char* GMAIL_TOTP_BASE32 = "aaaa bbbb cccc dddd eeee ffff gggg hhhh";
+const char* WIFI_SSID = "wifi_here";
+const char* WIFI_PASSWORD = "password_here";
 
 const char* NTP_SERVER_1 = "pool.ntp.org";
 const char* NTP_SERVER_2 = "time.google.com";
@@ -87,15 +101,9 @@ const char* mainMenuItems[] = {
   "Settings"
 };
 
-const char* passwordMenuItems[] = {
-  "Gmail",
-  "GitHub",
-  "AWS",
-  "Bank"
-};
-
 const char* totpMenuItems[] = {
-  "Google TOTP"
+  "Google",
+  "Blackboard"
 };
 
 const char* passwordActionMenuItems[] = {
@@ -104,34 +112,80 @@ const char* passwordActionMenuItems[] = {
   "UserTabPass"
 };
 
-const char* passwordUsernames[] = {
+const int MAX_PASSWORD_ITEMS = 12;
+
+int passwordMenuCount = 4;
+
+char passwordNameValues[MAX_PASSWORD_ITEMS][32] = {
+  "Gmail",
+  "GitHub",
+  "Blackboard",
+  "QNB"
+};
+
+char passwordUsernameValues[MAX_PASSWORD_ITEMS][128] = {
   "user.alpha01",
   "bluefalcon77",
   "cloud.user23",
   "banking_hero"
 };
 
-const char* passwordValues[] = {
+char passwordTextValues[MAX_PASSWORD_ITEMS][128] = {
   "MyGmailPassword123",
   "MyGitHubPassword456",
   "MyAwsPassword789",
   "MyBankPassword000"
 };
 
+char passwordTotpSecretValues[MAX_PASSWORD_ITEMS][96] = {
+  "",
+  "",
+  "",
+  ""
+};
+
+int getTotpMenuCount() {
+  int count = 0;
+
+  for (int i = 0; i < passwordMenuCount; i++) {
+    if (passwordTotpSecretValues[i][0] != '\0') {
+      count++;
+    }
+  }
+  return count;
+}
+
+int getTotpEntryIndexByVisibleIndex(int visibleIndex) {
+  int count = 0;
+
+  for (int i = 0; i < passwordMenuCount; i++) {
+    if (passwordTotpSecretValues[i][0] != '\0') {
+      if (count == visibleIndex) {
+        return i;
+      }
+      count++;
+    }
+  }
+  return -1;
+}
+
 int getCurrentMenuCount() {
   if (currentScreen == SCREEN_MAIN) return 3;
-  if (currentScreen == SCREEN_PASSWORDS) return 4;
+  if (currentScreen == SCREEN_PASSWORDS) return passwordMenuCount;
   if (currentScreen == SCREEN_PASSWORD_ACTIONS) return 3;
-  if (currentScreen == SCREEN_TOTP) return 1;
+  if (currentScreen == SCREEN_TOTP) return getTotpMenuCount();
   if (currentScreen == SCREEN_SETTINGS) return 0;
   return 0;
 }
 
 const char* getCurrentMenuItem(int i) {
   if (currentScreen == SCREEN_MAIN) return mainMenuItems[i];
-  if (currentScreen == SCREEN_PASSWORDS) return passwordMenuItems[i];
+  if (currentScreen == SCREEN_PASSWORDS) return passwordNameValues[i];
   if (currentScreen == SCREEN_PASSWORD_ACTIONS) return passwordActionMenuItems[i];
-  if (currentScreen == SCREEN_TOTP) return totpMenuItems[i];
+  if (currentScreen == SCREEN_TOTP) {
+    int entryIndex = getTotpEntryIndexByVisibleIndex(i);
+    if (entryIndex >= 0) return passwordNameValues[entryIndex];
+    return "";}
   return "";
 }
 
@@ -142,6 +196,44 @@ const char* getScreenTitle() {
   if (currentScreen == SCREEN_TOTP) return "TOTP";
   if (currentScreen == SCREEN_SETTINGS) return "Settings";
   return "";
+}
+
+void drawSettingsPortalScreen() {
+  gfx->fillScreen(COLOR_BLACK);
+
+  gfx->fillRoundRect(8, 8, 304, 38, 8, COLOR_DARKGREY);
+  gfx->setTextColor(COLOR_WHITE, COLOR_DARKGREY);
+  gfx->setTextSize(2);
+  gfx->setCursor(18, 19);
+  gfx->println("Settings Portal");
+
+  gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
+  gfx->setTextSize(2);
+
+  gfx->setCursor(16, 60);
+  gfx->println("SSID:");
+  gfx->setCursor(90, 60);
+  gfx->println("PassFill");
+
+  gfx->setCursor(16, 95);
+  gfx->println("PASS:");
+  gfx->setCursor(90, 95);
+  gfx->setTextSize(1);
+  gfx->println(settingsApPassword);
+  gfx->setTextSize(2);
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(COLOR_CYAN, COLOR_BLACK);
+  gfx->setCursor(16, 135);
+  gfx->println("Connect to this Wi-Fi network.");
+  gfx->setCursor(16, 150);
+  gfx->println("Then open any webpage.");
+
+  gfx->fillRoundRect(8, 205, 105, 30, 6, COLOR_DARKGREY);
+  gfx->setTextColor(COLOR_WHITE, COLOR_DARKGREY);
+  gfx->setTextSize(2);
+  gfx->setCursor(24, 213);
+  gfx->print("Back");
 }
 
 void drawMenu() {
@@ -273,6 +365,36 @@ void showSendingScreen(const char* text) {
   gfx->println("Typing via USB...");
 }
 
+bool loadActiveTotpFromEntry(int entryIndex) {
+  if (entryIndex < 0 || entryIndex >= passwordMenuCount) {
+    return false;
+  }
+
+  if (passwordTotpSecretValues[entryIndex][0] == '\0') {
+    return false;
+  }
+
+  activeTotpSecretLen = decodeBase32(
+    passwordTotpSecretValues[entryIndex],
+    activeTotpSecret,
+    sizeof(activeTotpSecret)
+  );
+
+  if (activeTotpSecretLen == 0) {
+    return false;
+  }
+
+  if (activeTotp != nullptr) {
+    delete activeTotp;
+    activeTotp = nullptr;
+  }
+
+  activeTotp = new TOTP(activeTotpSecret, activeTotpSecretLen);
+  activeTotpEntryIndex = entryIndex;
+
+  return true;
+}
+
 void openSelectedItem() {
   if (currentScreen == SCREEN_MAIN) {
     if (selectedIndex == 0) {
@@ -293,16 +415,9 @@ void openSelectedItem() {
 
     if (selectedIndex == 2) {
       currentScreen = SCREEN_SETTINGS;
-      gfx->fillScreen(COLOR_BLACK);
-      gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
-      gfx->setTextSize(2);
-      gfx->setCursor(30, 80);
-      gfx->println("Settings Portal");
-      gfx->setCursor(30, 120);
-      gfx->println("Coming later");
-      gfx->setTextSize(1);
-      gfx->setCursor(8, 225);
-      gfx->println("< Back");
+      selectedIndex = 0;
+      menuScrollOffset = 0;
+      startSettingsPortal();
       return;
     }
   }
@@ -317,6 +432,15 @@ void openSelectedItem() {
   }
 
   if (currentScreen == SCREEN_TOTP) {
+    int entryIndex = getTotpEntryIndexByVisibleIndex(selectedIndex);
+
+    if (!loadActiveTotpFromEntry(entryIndex)) {
+      showStatusScreen("TOTP Error", "Invalid secret");
+      delay(1200);
+      drawMenu();
+      return;
+    }
+
     if (!timeSynced) {
       if (!syncTimeOverWiFi()) {
         drawMenu();
@@ -332,17 +456,19 @@ void openSelectedItem() {
   }
 
   if (currentScreen == SCREEN_PASSWORD_ACTIONS) {
-    showSendingScreen(passwordMenuItems[activePasswordIndex]);
+    showSendingScreen(passwordNameValues[activePasswordIndex]);
     delay(300);
 
     if (selectedIndex == 0) {
-      Keyboard.print(passwordUsernames[activePasswordIndex]);
+      Keyboard.print(passwordUsernameValues[activePasswordIndex]);
     } else if (selectedIndex == 1) {
-      Keyboard.print(passwordValues[activePasswordIndex]);
+      Keyboard.print(passwordTextValues[activePasswordIndex]);
     } else if (selectedIndex == 2) {
-      Keyboard.print(passwordUsernames[activePasswordIndex]);
+      Keyboard.print(passwordUsernameValues[activePasswordIndex]);
+      delay(150);
       Keyboard.write(KEY_TAB);
-      Keyboard.print(passwordValues[activePasswordIndex]);
+      delay(250);
+      Keyboard.print(passwordTextValues[activePasswordIndex]);
     }
 
     delay(600);
@@ -365,7 +491,25 @@ void handleTouch() {
 
   int x = map(p.x, 200, 3900, 0, gfx->width());
   int y = map(p.y, 200, 3900, 0, gfx->height());
-
+  //for Settings
+  if (settingsPortalActive) {
+    // Back button
+    if (x < 130 && y > 190) {
+      stopSettingsPortal();
+      currentScreen = SCREEN_MAIN;
+      selectedIndex = 0;
+      menuScrollOffset = 0;
+      drawMenu();
+      return;
+    }
+    // Tap center area to type AP password
+    if (x >= 60 && x <= 280 && y >= 70 && y <= 130) {
+      Keyboard.print(settingsApPassword);
+      return;
+    }
+    return;
+  }
+  //for TOTP
   if (currentScreen == SCREEN_TOTP_VIEW) {
     if (x < 130 && y > 190) {
       handleBackAction();
@@ -378,10 +522,14 @@ void handleTouch() {
         return;
       }
 
-      char* code = gmailTotp->getCode(nowTime);
+      if (activeTotp == nullptr || activeTotpEntryIndex < 0) {
+        return;
+      }
+
+      char* code = activeTotp->getCode(nowTime);
       Keyboard.print(code);
 
-      showSendingScreen("Google TOTP");
+      showSendingScreen(passwordNameValues[activeTotpEntryIndex]);
       delay(600);
 
       lastTotpRedraw = 0;
@@ -464,20 +612,7 @@ size_t decodeBase32(const char* input, uint8_t* output, size_t maxOutputLen) {
   return outLen;
 }
 
-bool initTotp() {
-  gmailTotpSecretLen = decodeBase32(
-    GMAIL_TOTP_BASE32,
-    gmailTotpSecret,
-    sizeof(gmailTotpSecret)
-  );
 
-  if (gmailTotpSecretLen == 0) {
-    return false;
-  }
-
-  gmailTotp = new TOTP(gmailTotpSecret, gmailTotpSecretLen);
-  return true;
-}
 
 void showStatusScreen(const char* title, const char* subtitle) {
   gfx->fillScreen(COLOR_BLACK);
@@ -569,11 +704,13 @@ void showTotpCodeScreen(const char* title, const char* code, int secondsRemainin
   int barW = 210;
   int barH = 14;
 
-  int progressWidth = map(secondsRemaining, 0, 30, 0, barW);
+  int progressWidth = map(secondsRemaining, 0, 30, 0, barW - 4);
+  if (progressWidth < 0) progressWidth = 0;
+  if (progressWidth > barW - 4) progressWidth = barW - 4;
 
-  gfx->drawRoundRect(barX, barY, barW, barH, 7, COLOR_WHITE);
-  gfx->fillRoundRect(barX + 2, barY + 2, progressWidth - 4, barH - 4, 5, COLOR_GREEN);
-
+  if (progressWidth > 0) {
+    gfx->fillRoundRect(barX + 2, barY + 2, progressWidth, barH - 4, 5, COLOR_GREEN);
+  }
   gfx->setTextColor(COLOR_WHITE, COLOR_BLACK);
   gfx->setTextSize(2);
   gfx->setCursor(265, 152);
@@ -593,6 +730,275 @@ void showTotpCodeScreen(const char* title, const char* code, int secondsRemainin
   gfx->print("Tap code to type");
 }
 
+String htmlEscape(const char* input) {
+  String s = input ? input : "";
+  s.replace("&", "&amp;");
+  s.replace("<", "&lt;");
+  s.replace(">", "&gt;");
+  s.replace("\"", "&quot;");
+  return s;
+}
+
+String generateApPassword() {
+  const char charset[] = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*";
+  const int passwordLength = 16;
+
+  String result = "";
+  result.reserve(passwordLength);
+
+  for (int i = 0; i < passwordLength; i++) {
+    result += charset[esp_random() % (sizeof(charset) - 1)];
+  }
+
+  return result;
+}
+
+void loadSavedPasswords() {
+  prefs.begin("vault", true);
+
+  int storedCount = prefs.getInt("count", 4);
+  if (storedCount < 1) storedCount = 1;
+  if (storedCount > MAX_PASSWORD_ITEMS) storedCount = MAX_PASSWORD_ITEMS;
+  passwordMenuCount = storedCount;
+
+  for (int i = 0; i < passwordMenuCount; i++) {
+    String nameKey = "name" + String(i);
+    String userKey = "user" + String(i);
+    String passKey = "pass" + String(i);
+    String totpKey = "totp" + String(i);
+
+    String defaultName = passwordNameValues[i];
+    String defaultUser = passwordUsernameValues[i];
+    String defaultPass = passwordTextValues[i];
+    String defaultTotp = passwordTotpSecretValues[i];
+
+    String loadedName = prefs.getString(nameKey.c_str(), defaultName);
+    String loadedUser = prefs.getString(userKey.c_str(), defaultUser);
+    String loadedPass = prefs.getString(passKey.c_str(), defaultPass);
+    String loadedTotp = prefs.getString(totpKey.c_str(), defaultTotp);
+
+    loadedTotp.toCharArray(passwordTotpSecretValues[i], sizeof(passwordTotpSecretValues[i]));
+    loadedName.toCharArray(passwordNameValues[i], sizeof(passwordNameValues[i]));
+
+    loadedUser.toCharArray(passwordUsernameValues[i], sizeof(passwordUsernameValues[i]));
+    loadedPass.toCharArray(passwordTextValues[i], sizeof(passwordTextValues[i]));
+  }
+
+  prefs.end();
+}
+
+void savePasswordsToPreferences() {
+  prefs.begin("vault", false);
+  prefs.clear();
+  prefs.putInt("count", passwordMenuCount);
+
+  for (int i = 0; i < passwordMenuCount; i++) {
+    String nameKey = "name" + String(i);
+    String userKey = "user" + String(i);
+    String passKey = "pass" + String(i);
+    String totpKey = "totp" + String(i);
+
+    prefs.putString(totpKey.c_str(), passwordTotpSecretValues[i]);
+    prefs.putString(nameKey.c_str(), passwordNameValues[i]);
+    prefs.putString(userKey.c_str(), passwordUsernameValues[i]);
+    prefs.putString(passKey.c_str(), passwordTextValues[i]);
+  }
+
+  prefs.end();
+}
+
+//web page
+void handlePortalRoot() {
+  String html = "";
+  html += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>PassFill</title>";
+  html += "<style>";
+  html += "body{margin:0;font-family:Arial;background:#0b0b0b;color:#f5f5f5;padding:20px;}";
+  html += ".wrap{max-width:900px;margin:0 auto;}";
+  html += ".card{background:#161616;border-radius:18px;padding:20px;margin-bottom:20px;}";
+  html += "input{width:100%;padding:12px;border-radius:10px;border:1px solid #333;background:#0f0f0f;color:white;margin-bottom:12px;box-sizing:border-box;}";
+  html += "button,a.btn{padding:12px 18px;border-radius:10px;border:0;background:#4d8ef7;color:white;text-decoration:none;font-weight:bold;display:inline-block;margin:4px;}";
+  html += "a.delete{background:#ef4b3f;}";
+  html += "table{width:100%;border-collapse:collapse;}td,th{border:1px solid #333;padding:10px;text-align:left;}";
+  html += "</style></head><body><div class='wrap'>";
+  html += "<h1>PassFill</h1>";
+
+  html += "<div class='card'><h2>Add Password</h2>";
+  html += "<form method='POST' action='/save'>";
+  html += "<input name='item_name' placeholder='Name, e.g. Gmail'>";
+  html += "<input name='item_user' placeholder='Username'>";
+  html += "<input name='item_pass' placeholder='Password'>";
+  html += "<label style='display:block;margin:10px 0;color:#ddd;'>";
+  html += "<input type='checkbox' name='has_totp' value='1' style='width:auto;margin-right:8px;'>";
+  html += "Add TOTP for this account";
+  html += "</label>";
+  html += "<input name='item_totp' placeholder='TOTP Base32 secret, optional'>";
+  html += "<button type='submit'>Add</button>";
+  html += "</form></div>";
+
+  html += "<div class='card'><h2>Saved Passwords</h2>";
+  html += "<table><tr><th>Name</th><th>Username</th><th>TOTP</th><th>Action</th></tr>";
+
+  for (int i = 0; i < passwordMenuCount; i++) {
+    html += "<tr>";
+    html += "<td>" + htmlEscape(passwordNameValues[i]) + "</td>";
+    html += "<td>" + htmlEscape(passwordUsernameValues[i]) + "</td>";
+    html += "<td>";
+    html += (passwordTotpSecretValues[i][0] != '\0') ? "Yes" : "No";
+    html += "</td>";
+    html += "<td><a class='btn delete' href='/delete?index=" + String(i) + "'>Delete</a></td>";
+    html += "</tr>";
+  }
+
+  html += "</table></div>";
+  html += "</div></body></html>";
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/html", html);
+}
+//save & delete handlers
+void handlePortalSave() {
+  String itemName = server.arg("item_name");
+  String itemUser = server.arg("item_user");
+  String itemPass = server.arg("item_pass");
+
+  String itemTotp = server.arg("item_totp");
+  bool hasTotp = server.hasArg("has_totp");
+
+  itemTotp.trim();
+  itemTotp.replace(" ", "");
+  itemTotp.replace("-", "");
+  itemTotp.toUpperCase();
+
+  if (hasTotp && itemTotp.length() == 0) {
+    server.send(200, "text/html", "<html><body><h2>TOTP secret required when TOTP is checked</h2><a href='/'>Back</a></body></html>");
+    return;
+  }
+  itemName.trim();
+  itemUser.trim();
+  itemPass.trim();
+
+  if (itemName.length() == 0 || itemPass.length() == 0) {
+    server.send(200, "text/html", "<html><body><h2>Name and password required</h2><a href='/'>Back</a></body></html>");
+    return;
+  }
+
+  if (passwordMenuCount >= MAX_PASSWORD_ITEMS) {
+    server.send(200, "text/html", "<html><body><h2>Storage full</h2><a href='/'>Back</a></body></html>");
+    return;
+  }
+
+  itemName.toCharArray(passwordNameValues[passwordMenuCount], sizeof(passwordNameValues[passwordMenuCount]));
+  itemUser.toCharArray(passwordUsernameValues[passwordMenuCount], sizeof(passwordUsernameValues[passwordMenuCount]));
+  itemPass.toCharArray(passwordTextValues[passwordMenuCount], sizeof(passwordTextValues[passwordMenuCount]));
+  if (hasTotp) {
+    itemTotp.toCharArray(passwordTotpSecretValues[passwordMenuCount], sizeof(passwordTotpSecretValues[passwordMenuCount]));
+  } else {
+    passwordTotpSecretValues[passwordMenuCount][0] = '\0';
+  }
+
+  passwordMenuCount++;
+
+  savePasswordsToPreferences();
+
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handlePortalDelete() {
+  if (!server.hasArg("index")) {
+    server.sendHeader("Location", "/");
+    server.send(303);
+    return;
+  }
+
+  int deleteIndex = server.arg("index").toInt();
+
+  if (deleteIndex < 0 || deleteIndex >= passwordMenuCount) {
+    server.sendHeader("Location", "/");
+    server.send(303);
+    return;
+  }
+
+  for (int i = deleteIndex; i < passwordMenuCount - 1; i++) {
+    strlcpy(passwordNameValues[i], passwordNameValues[i + 1], sizeof(passwordNameValues[i]));
+    strlcpy(passwordUsernameValues[i], passwordUsernameValues[i + 1], sizeof(passwordUsernameValues[i]));
+    strlcpy(passwordTextValues[i], passwordTextValues[i + 1], sizeof(passwordTextValues[i]));
+    strlcpy(passwordTotpSecretValues[i], passwordTotpSecretValues[i + 1], sizeof(passwordTotpSecretValues[i]));
+  }
+
+  passwordMenuCount--;
+  passwordNameValues[passwordMenuCount][0] = '\0';
+  passwordUsernameValues[passwordMenuCount][0] = '\0';
+  passwordTextValues[passwordMenuCount][0] = '\0';
+  passwordTotpSecretValues[passwordMenuCount][0] = '\0';
+
+  savePasswordsToPreferences();
+
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+//start/stop portal functions
+void stopSettingsPortal();
+void startSettingsPortal() {
+  stopSettingsPortal();
+
+  WiFi.disconnect(true, true);
+  WiFi.softAPdisconnect(true);
+  delay(200);
+
+  WiFi.mode(WIFI_AP);
+  delay(100);
+
+  bool apStarted = WiFi.softAP("PassFill", settingsApPassword.c_str());
+  delay(300);
+
+  if (!apStarted) {
+    showStatusScreen("AP Failed", "Check password length");
+    delay(1200);
+    currentScreen = SCREEN_MAIN;
+    drawMenu();
+    return;
+  }
+
+  server.stop();
+  dnsServer.stop();
+
+  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+
+  server.on("/", HTTP_GET, handlePortalRoot);
+  server.on("/save", HTTP_POST, handlePortalSave);
+  server.on("/delete", HTTP_GET, handlePortalDelete);
+
+  server.on("/generate_204", HTTP_GET, handlePortalRoot);
+  server.on("/hotspot-detect.html", HTTP_GET, handlePortalRoot);
+  server.on("/ncsi.txt", HTTP_GET, handlePortalRoot);
+  server.onNotFound(handlePortalRoot);
+
+  server.begin();
+
+  settingsPortalActive = true;
+  drawSettingsPortalScreen();
+}
+
+void stopSettingsPortal() {
+  if (!settingsPortalActive) return;
+
+  dnsServer.stop();
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  settingsPortalActive = false;
+}
+
+void processSettingsPortal() {
+  if (!settingsPortalActive) return;
+
+  dnsServer.processNextRequest();
+  server.handleClient();
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -605,16 +1011,8 @@ void setup() {
   touch.begin();
   touch.setRotation(1);
 
-  if (!initTotp()) {
-    gfx->fillScreen(COLOR_BLACK);
-    gfx->setTextColor(COLOR_RED, COLOR_BLACK);
-    gfx->setTextSize(2);
-    gfx->setCursor(25, 80);
-    gfx->println("TOTP Error");
-    gfx->setCursor(25, 120);
-    gfx->println("Bad Base32");
-    while (true) delay(1000);
-  }
+  settingsApPassword = generateApPassword();
+  loadSavedPasswords();
 
   drawBootScreen();
   delay(1200);
@@ -627,17 +1025,18 @@ void setup() {
 }
 
 void loop() {
-
+  processSettingsPortal();
   if (currentScreen == SCREEN_TOTP_VIEW) {
     time_t nowTime;
 
     if (getCurrentUnixTime(nowTime)) {
       int secondsRemaining = 30 - (nowTime % 30);
-      if (secondsRemaining == 30) secondsRemaining = 0;
 
       if (lastTotpRedraw != (unsigned long)nowTime) {
-        char* code = gmailTotp->getCode(nowTime);
-        showTotpCodeScreen("Google TOTP", code, secondsRemaining);
+        if (activeTotp != nullptr && activeTotpEntryIndex >= 0) {
+          char* code = activeTotp->getCode(nowTime);
+          showTotpCodeScreen(passwordNameValues[activeTotpEntryIndex], code, secondsRemaining);
+        }
         lastTotpRedraw = (unsigned long)nowTime;
       }
     }
